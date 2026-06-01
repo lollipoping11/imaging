@@ -192,15 +192,40 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		}
 
 		if thresholdValue > 0 {
-			// Convert the image to grayscale (for thresholding)
-			gocv.CvtColor(buf, &buf, gocv.ColorBGRToGray)
-			// Apply thresholding
-			gocv.Threshold(buf, &buf, float32(thresholdValue), 255.0, gocv.ThresholdBinary+gocv.ThresholdOtsu)
-			// Apply dilation
-			kernel := gocv.GetStructuringElement(gocv.MorphRect, image.Pt(5, 5))
-			gocv.Dilate(buf, &buf, kernel)
-			gocv.Erode(buf, &buf, kernel)
-		}
+    // Convert to HSV colour space
+    hsv := gocv.NewMat()
+    defer hsv.Close()
+    gocv.CvtColor(buf, &hsv, gocv.ColorBGRToHSV)
+    
+    // Split into H, S, V channels
+    channels := gocv.Split(hsv)
+    saturation := channels[1]  // S channel
+    value := channels[2]       // V channel (brightness)
+    
+    // Create mask: high brightness (track is bright) AND low saturation (track is white not yellow)
+    brightMask := gocv.NewMat()
+    satMask := gocv.NewMat()
+    defer brightMask.Close()
+    defer satMask.Close()
+    
+    // Brightness > 200 (white track)
+    gocv.Threshold(value, &brightMask, 200, 255, gocv.ThresholdBinary)
+    // Saturation < 40 (white = low saturation, glare on wood = higher saturation)
+    gocv.Threshold(saturation, &satMask, 40, 255, gocv.ThresholdBinaryInv)
+    
+    // Combine: must be BOTH bright AND low saturation
+    gocv.BitwiseAnd(brightMask, satMask, &buf)
+    
+    // Clean up channels
+    for _, ch := range channels {
+        ch.Close()
+    }
+    
+    // Apply dilation and erosion to clean up noise
+    kernel := gocv.GetStructuringElement(gocv.MorphRect, image.Pt(5, 5))
+    gocv.Dilate(buf, &buf, kernel)
+    gocv.Erode(buf, &buf, kernel)
+}
 
 		var longestConsecutive *SliceDescriptor = nil
 
