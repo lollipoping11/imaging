@@ -15,12 +15,10 @@ import (
 )
 
 type SliceDescriptor struct {
-	Start int // Start index of the array
-	End   int // End index of the array
+	Start int
+	End   int
 }
 
-// This function will cast a vertical scan on the given x-line, starting at coordinate Y and proceeding onwards (= towards a smaller Y)
-// it returns the Y-coordinate of the first black pixel it encounters
 func verticalScanUp(image *gocv.Mat, x int, startY int) int {
 	y := startY
 	for y >= 0 {
@@ -32,34 +30,21 @@ func verticalScanUp(image *gocv.Mat, x int, startY int) int {
 	return y + 1
 }
 
-// This function scans the slice for points that are full white (non-black) (after thresholding)
-// It returns an array of descriptions of the consecutive white points
-// r.i.p. mrbuggy :(
 func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor {
 	res := []SliceDescriptor{}
-
 	var currentConsecutive *SliceDescriptor = nil
 
 	for i := 0; i < imageSlice.Cols()-1; i++ {
 		currentByte := imageSlice.GetVecbAt(0, i)[0]
 
-		// byte(0) indicates black, byte(255) indicates white
 		if currentByte != byte(0) {
-			// Current point is a white point. Is there already a consecutive array?
 			if currentConsecutive == nil {
-				// No, create a new one
-				currentConsecutive = &SliceDescriptor{
-					Start: i,
-					End:   i,
-				}
+				currentConsecutive = &SliceDescriptor{Start: i, End: i}
 			} else {
-				// Yes, extend the current one
 				currentConsecutive.End = i
 			}
 		} else {
-			// Current point is black. Is there a consecutive array?
 			if currentConsecutive != nil {
-				// Yes, add it to the result, if it's at minimum 1 pixel wide
 				if currentConsecutive.End-currentConsecutive.Start > 0 {
 					res = append(res, *currentConsecutive)
 				}
@@ -68,7 +53,6 @@ func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor 
 		}
 	}
 
-	// We reached the right edge of the image. If there is a consecutive array, add it to the result
 	if currentConsecutive != nil && currentConsecutive.End-currentConsecutive.Start > 0 {
 		res = append(res, *currentConsecutive)
 	}
@@ -76,23 +60,30 @@ func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor 
 	return res
 }
 
-// This function takes an array of slice descriptors and finds the one with the most consecutive white pixels
-// It returns nil if no such slice is found
-// The second parameter is the preferred X. If a slice is found that contains this preferred x, this slice is returned
-// and not the longest
 func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferredX int) *SliceDescriptor {
 	if len(sliceDescriptors) == 0 {
 		return nil
 	}
 
-	longest := sliceDescriptors[0]
+	// Filter out slices that are too wide (glare) or too narrow (noise)
+	filtered := []SliceDescriptor{}
 	for _, desc := range sliceDescriptors {
-		// If this slice contains the preferredX, choose this one
+		width := desc.End - desc.Start
+		if width > 20 && width < 500 {
+			filtered = append(filtered, desc)
+		}
+	}
+
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	longest := filtered[0]
+	for _, desc := range filtered {
 		if preferredX > desc.Start && preferredX < desc.End {
-			log.Debug().Int("preferredX", preferredX).Msg("Returned slice containing preferred X, instead of longest slice")
+			log.Debug().Int("preferredX", preferredX).Msg("Returned slice containing preferred X")
 			return &desc
 		}
-
 		if (desc.End - desc.Start) > (longest.End - longest.Start) {
 			longest = desc
 		}
@@ -101,21 +92,16 @@ func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferr
 	return &longest
 }
 
-// Global values that can be tuned OTA
 var thresholdValue int
 
-// Runs the program logic
 func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration) error {
 	if configuration == nil {
 		return fmt.Errorf("configuration cannot be accessed")
 	}
 
-	//
-	// Get configuration values from service.json
-	//
 	gstPipeline, err := configuration.GetStringSafe("gstreamer-pipeline")
 	if err != nil {
-		log.Err(err).Msg("Failed to get gstreamer-pipeline from tuning. Is it defined in service.yaml?")
+		log.Err(err).Msg("Failed to get gstreamer-pipeline from tuning")
 		return err
 	}
 	thFloat, err := configuration.GetFloatSafe("threshold-value")
@@ -123,50 +109,43 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		return err
 	}
 	thresholdValue = int(thFloat)
-	// Fetch width to put in gstreaqmer pipeline
+
 	imgWidthFloat, err := configuration.GetFloatSafe("img-width")
 	if err != nil {
 		return err
 	}
 	imgWidth := int(imgWidthFloat)
-	// Fetch height to put in gstreamer pipeline
+
 	imgHeightFloat, err := configuration.GetFloatSafe("img-height")
 	if err != nil {
 		return err
 	}
 	imgHeight := int(imgHeightFloat)
-	// Fetch image fps to put in gstreamer pipeline
+
 	imgFpsFloat, err := configuration.GetFloatSafe("img-fps")
 	if err != nil {
 		return err
 	}
 	imgFps := int(imgFpsFloat)
-	// Create the gstreamer pipeline with the fetched parameters
+
 	gstPipeline = fmt.Sprintf(gstPipeline, imgWidth, imgHeight, imgFps)
 	log.Info().Str("pipeline", gstPipeline).Msg("Using gstreamer pipeline")
 
-	// Create socket to send images to
 	imageOutput := service.GetWriteStream("path")
 	if err != nil {
 		return err
 	}
 
-	// Open video capture using gstreamer pipeline
 	cam, err := gocv.OpenVideoCapture(gstPipeline)
 	if err != nil {
 		return err
 	}
 	defer cam.Close()
 
-	// Complete images are stored in this mat
 	buf := gocv.NewMat()
 	defer buf.Close()
 
-	// Y coordinate of the horizontal slice used for steering
 	sliceY := int(imgHeightFloat * 0.60)
-
-	// Start with the middle of the image as the preferred X to find the white slice
-	// (assuming that the car starts on the middle of the track)
 	preferredX := imgWidth / 2
 
 	for {
@@ -184,7 +163,7 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 
 		newThreshold, err := configuration.GetFloat("threshold-value")
 		if err != nil {
-			log.Err(err).Msg("Failed to get threshold value from tuning. Is it defined in service.yaml?")
+			log.Err(err).Msg("Failed to get threshold value from tuning")
 			continue
 		} else if thresholdValue != int(newThreshold) {
 			log.Info().Float64("threshold", newThreshold).Msg("Got new threshold value")
@@ -192,9 +171,11 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		}
 
 		if thresholdValue > 0 {
+			// Convert to grayscale
 			gocv.CvtColor(buf, &buf, gocv.ColorBGRToGray)
-			// Use fixed high threshold instead of Otsu to reject glare
-			gocv.Threshold(buf, &buf, float32(thresholdValue), 255.0, gocv.ThresholdBinary)
+			// Use Otsu thresholding — glare rejection handled by width filter
+			gocv.Threshold(buf, &buf, float32(thresholdValue), 255.0, gocv.ThresholdBinary+gocv.ThresholdOtsu)
+			// Clean up noise
 			kernel := gocv.GetStructuringElement(gocv.MorphRect, image.Pt(5, 5))
 			gocv.Dilate(buf, &buf, kernel)
 			gocv.Erode(buf, &buf, kernel)
@@ -215,58 +196,41 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		for uint32(usedSlice) < (uint32(imgHeight)-1) && (longestConsecutive == nil) {
 			usedSlice += 10
 
-			// Take a slice that is used to steer on
 			horizontalSlice := buf.Region(image.Rect(0, sliceY, imgWidth, sliceY+1))
-			// Find the consecutive white points
 			sliceDescriptors := getConsecutiveWhitePointsFromSlice(&horizontalSlice)
-			// Find the longest consecutive white slice
 			longestConsecutive = getLongestConsecutiveWhiteSlice(sliceDescriptors, preferredX)
 
 			if longestConsecutive != nil && (preferredX < longestConsecutive.Start || preferredX > longestConsecutive.End) {
 				longestConsecutive = nil
 			}
-			horizontalSlice.Close() // avoid memory leaks
+			horizontalSlice.Close()
 		}
 
-		// Create a canvas that can be drawn on
 		canvasObjects := make([]*pb_output.CanvasObject, 0)
-		// Draw points where the longest consecutive slice starts, ends and the middle
 		if longestConsecutive != nil {
 			middleX := (longestConsecutive.Start + longestConsecutive.End) / 2
 			preferredX = middleX
 
-			// Draw start
 			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
 				Object: &pb_output.CanvasObject_Circle_{
 					Circle: &pb_output.CanvasObject_Circle{
-						Center: &pb_output.CanvasObject_Point{
-							X: uint32(longestConsecutive.Start),
-							Y: uint32(sliceY),
-						},
+						Center: &pb_output.CanvasObject_Point{X: uint32(longestConsecutive.Start), Y: uint32(sliceY)},
 						Radius: 1,
 					},
 				},
 			})
-			// Draw end
 			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
 				Object: &pb_output.CanvasObject_Circle_{
 					Circle: &pb_output.CanvasObject_Circle{
-						Center: &pb_output.CanvasObject_Point{
-							X: uint32(longestConsecutive.End),
-							Y: uint32(sliceY),
-						},
+						Center: &pb_output.CanvasObject_Point{X: uint32(longestConsecutive.End), Y: uint32(sliceY)},
 						Radius: 1,
 					},
 				},
 			})
-			// Draw middle
 			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
 				Object: &pb_output.CanvasObject_Circle_{
 					Circle: &pb_output.CanvasObject_Circle{
-						Center: &pb_output.CanvasObject_Point{
-							X: uint32(middleX),
-							Y: uint32(sliceY),
-						},
+						Center: &pb_output.CanvasObject_Point{X: uint32(middleX), Y: uint32(sliceY)},
 						Radius: 1,
 					},
 				},
@@ -279,19 +243,15 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			Height:  uint32(imgHeight),
 		}
 
-		// used for JPEG compression
 		var compressionParams [2]int
 		compressionParams[0] = gocv.IMWriteJpegQuality
-		compressionParams[1] = 30 // the quality
-		// Convert the image to JPEG bytes
+		compressionParams[1] = 30
 		imgBytes, err := gocv.IMEncodeWithParams(".jpg", buf, compressionParams[:])
 		if err != nil {
 			log.Err(err).Msg("Error encoding image")
 			return err
 		}
 
-		// Populate the horizontal scan that indicates the edges of the track
-		// (currently, there is just one scan)
 		horizontal_scans := make([]*pb_output.HorizontalScan, 0)
 		if longestConsecutive != nil {
 			horizontal_scans = append(horizontal_scans, &pb_output.HorizontalScan{
@@ -303,7 +263,6 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			log.Debug().Msg("No trajectory added")
 		}
 
-		// Make it a sensor output
 		output := pb_output.SensorOutput{
 			SensorId:  25,
 			Timestamp: uint64(time.Now().UnixMilli()),
@@ -322,14 +281,13 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			},
 		}
 		outputBytes, err := proto.Marshal(&output)
-		imgBytes.Close() // avoid memory leaks
+		imgBytes.Close()
 
 		if err != nil {
 			log.Err(err).Msg("Error marshalling sensor output")
 			continue
 		}
 
-		// Send the image
 		err = imageOutput.WriteBytes(outputBytes)
 		if err != nil {
 			log.Err(err).Int("byte len", len(outputBytes)).Msg("Error sending image")
@@ -342,11 +300,9 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 
 func onTerminate(sig os.Signal) error {
 	log.Info().Msg("Terminating")
-
 	return nil
 }
 
-// Used to start the program with the correct arguments
 func main() {
 	roverlib.Run(run, onTerminate)
 }
