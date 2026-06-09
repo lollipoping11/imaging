@@ -491,21 +491,24 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		horizontalScans := make([]*pb_output.HorizontalScan, 0)
 
 		if len(scans) > 0 {
-			for i, scan := range scans {
-				scanY := uint32(scan.Y)
+			best := scans[0]
 
-				// Only the first/best scan gets the finish marker.
-				// XLeft and XRight stay normal, so steering should not break.
-				if i == 0 && finishLineDetected {
-					scanY = 9999
-				}
+			scanY := uint32(best.Y)
 
-				horizontalScans = append(horizontalScans, &pb_output.HorizontalScan{
-					XLeft:  uint32(scan.Start),
-					XRight: uint32(scan.End),
-					Y:      scanY,
-				})
+			// Keep XLeft/XRight normal.
+			// Only mark finish line through Y.
+			if finishLineDetected {
+				scanY = 9999
 			}
+
+			// IMPORTANT:
+			// Send only ONE scan to the controller.
+			// Multiple scans make the car unstable.
+			horizontalScans = append(horizontalScans, &pb_output.HorizontalScan{
+				XLeft:  uint32(best.Start),
+				XRight: uint32(best.End),
+				Y:      scanY,
+			})
 		} else {
 			log.Debug().Msg("No trajectory added")
 		}
