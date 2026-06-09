@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"image"
-	"math"
 	"os"
 	"time"
 
@@ -20,11 +19,10 @@ type SliceDescriptor struct {
 	End   int
 }
 
-type ScanCandidate struct {
+type TrackScan struct {
 	Start int
 	End   int
 	Y     int
-	Score float64
 }
 
 var thresholdValue int
@@ -49,7 +47,10 @@ func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor 
 
 		if currentByte != byte(0) {
 			if currentConsecutive == nil {
-				currentConsecutive = &SliceDescriptor{Start: i, End: i}
+				currentConsecutive = &SliceDescriptor{
+					Start: i,
+					End:   i,
+				}
 			} else {
 				currentConsecutive.End = i
 			}
@@ -70,84 +71,27 @@ func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor 
 	return res
 }
 
-func clampInt(v int, min int, max int) int {
-	if v < min {
-		return min
-	}
-	if v > max {
-		return max
-	}
-	return v
-}
-
-func widthOf(desc SliceDescriptor) int {
-	return desc.End - desc.Start
-}
-
-func centerOf(desc SliceDescriptor) int {
-	return (desc.Start + desc.End) / 2
-}
-
-func isReasonableTrackWidth(width int, previousWidth float64, imgWidth int) bool {
-	// Absolute safety limits.
-	// Too small = glare/noise/tiny white patch.
-	// Too large = glare/whole image washed out.
-	absoluteMin := 120
-	absoluteMax := int(float64(imgWidth) * 0.92)
-
-	if width < absoluteMin || width > absoluteMax {
-		return false
+func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferredX int) *SliceDescriptor {
+	if len(sliceDescriptors) == 0 {
+		return nil
 	}
 
-	// Adaptive limits from previous good track width.
-	// Generous so corners are not skipped.
-	if previousWidth > 0 {
-		minAdaptive := previousWidth * 0.45
-		maxAdaptive := previousWidth * 1.45
+	longest := sliceDescriptors[0]
 
-		if float64(width) < minAdaptive || float64(width) > maxAdaptive {
-			return false
+	for _, desc := range sliceDescriptors {
+		if preferredX > desc.Start && preferredX < desc.End {
+			return &desc
+		}
+
+		if (desc.End - desc.Start) > (longest.End - longest.Start) {
+			longest = desc
 		}
 	}
 
-	return true
+	return &longest
 }
 
-func scoreCandidate(desc SliceDescriptor, y int, preferredX int, previousWidth float64, imgHeight int) float64 {
-	width := float64(widthOf(desc))
-	center := float64(centerOf(desc))
-
-	score := 0.0
-
-	// Prefer slices containing the previous/expected center.
-	if preferredX > desc.Start && preferredX < desc.End {
-		score += 1000.0
-	}
-
-	// Prefer center close to previous center.
-	centerDistance := math.Abs(center - float64(preferredX))
-	score -= centerDistance * 1.5
-
-	// Prefer widths close to previous good width, but not too aggressively.
-	if previousWidth > 0 {
-		widthDistance := math.Abs(width - previousWidth)
-		score -= widthDistance * 0.8
-	}
-
-	// Prefer lower scan lines slightly, because they are closer to the car.
-	yPreference := float64(y) / float64(imgHeight)
-	score += yPreference * 100.0
-
-	// Prefer useful track widths around normal observed values.
-	// Your normal logs were roughly 420-540.
-	if width >= 350 && width <= 560 {
-		score += 150.0
-	}
-
-	return score
-}
-
-func getBestCandidateAtY(buf *gocv.Mat, y int, preferredX int, previousWidth float64) *ScanCandidate {
+func getTrackScanAtY(buf *gocv.Mat, y int, preferredX int, previousWidth float64) *TrackScan {
 	imgWidth := buf.Cols()
 	imgHeight := buf.Rows()
 
@@ -159,82 +103,70 @@ func getBestCandidateAtY(buf *gocv.Mat, y int, preferredX int, previousWidth flo
 	defer horizontalSlice.Close()
 
 	sliceDescriptors := getConsecutiveWhitePointsFromSlice(&horizontalSlice)
+	candidate := getLongestConsecutiveWhiteSlice(sliceDescriptors, preferredX)
 
-	var best *ScanCandidate = nil
+	if candidate == nil {
+		return nil
+	}
 
-	for _, desc := range sliceDescriptors {
-		width := widthOf(desc)
+	width := candidate.End - candidate.Start
 
-		if !isReasonableTrackWidth(width, previousWidth, imgWidth) {
+	// Hard limits:
+	// Too small = noise/glare patch.
+	// Too large = glare/washed-out image.
+	if width < 180 {
+		return nil
+	}
+
+	if width > int(float64(imgWidth)*0.90) {
+		return nil
+	}
+
+	// Adaptive limits:
+	// Generous so corners are not skipped.
+	if previousWidth > 0 {
+		minAllowed := previousWidth * 0.60
+		maxAllowed := previousWidth * 1.40
+
+		if float64(width) < minAllowed || float64(width) > maxAllowed {
+			return nil
+		}
+	}
+
+	return &TrackScan{
+		Start: candidate.Start,
+		End:   candidate.End,
+		Y:     y,
+	}
+}
+
+func findStableTrackScan(buf *gocv.Mat, sliceY int, preferredX int, previousWidth float64) *TrackScan {
+	imgHeight := buf.Rows()
+
+	// First try the exact same scan line as normal imaging.
+	normalScan := getTrackScanAtY(buf, sliceY, preferredX, previousWidth)
+	if normalScan != nil {
+		return normalScan
+	}
+
+	// Only if normal scan looks bad, try nearby backup lines.
+	// Closest first to keep driving behavior close to base imaging.
+	offsets := []int{-20, 20, -40, 40, -60, 60, -80, 80}
+
+	for _, offset := range offsets {
+		y := sliceY + offset
+
+		if y < int(float64(imgHeight)*0.35) || y > int(float64(imgHeight)*0.80) {
 			continue
 		}
 
-		score := scoreCandidate(desc, y, preferredX, previousWidth, imgHeight)
-
-		candidate := ScanCandidate{
-			Start: desc.Start,
-			End:   desc.End,
-			Y:     y,
-			Score: score,
-		}
-
-		if best == nil || candidate.Score > best.Score {
-			best = &candidate
+		scan := getTrackScanAtY(buf, y, preferredX, previousWidth)
+		if scan != nil {
+			return scan
 		}
 	}
 
-	return best
-}
-
-func findTrackScans(buf *gocv.Mat, preferredX int, previousWidth float64, baseSliceY int) []ScanCandidate {
-	imgHeight := buf.Rows()
-
-	// Multiple scan lines.
-	// Lower lines are for normal driving.
-	// Higher lines help prepare for corners.
-	scanYs := []int{
-		int(float64(imgHeight) * 0.72),
-		int(float64(imgHeight) * 0.66),
-		int(float64(imgHeight) * 0.60),
-		int(float64(imgHeight) * 0.54),
-		int(float64(imgHeight) * 0.48),
-		int(float64(imgHeight) * 0.42),
-	}
-
-	// Also keep the original base sliceY behavior.
-	scanYs = append(scanYs, baseSliceY)
-
-	candidates := make([]ScanCandidate, 0)
-
-	for _, y := range scanYs {
-		y = clampInt(y, 0, imgHeight-2)
-
-		candidate := getBestCandidateAtY(buf, y, preferredX, previousWidth)
-		if candidate != nil {
-			candidates = append(candidates, *candidate)
-		}
-	}
-
-	if len(candidates) == 0 {
-		return candidates
-	}
-
-	// Sort manually by score descending.
-	for i := 0; i < len(candidates); i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].Score > candidates[i].Score {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
-			}
-		}
-	}
-
-	// Return best 3 scans.
-	// First one is the one the controller should mainly use.
-	if len(candidates) > 3 {
-		candidates = candidates[:3]
-	}
-
-	return candidates
+	return nil
 }
 
 func rowBlackRatioInTrack(buf *gocv.Mat, y int, xLeft int, xRight int) float64 {
@@ -242,8 +174,13 @@ func rowBlackRatioInTrack(buf *gocv.Mat, y int, xLeft int, xRight int) float64 {
 		return 0.0
 	}
 
-	xLeft = clampInt(xLeft, 0, buf.Cols()-1)
-	xRight = clampInt(xRight, 0, buf.Cols()-1)
+	if xLeft < 0 {
+		xLeft = 0
+	}
+
+	if xRight >= buf.Cols() {
+		xRight = buf.Cols() - 1
+	}
 
 	if xRight <= xLeft {
 		return 0.0
@@ -261,11 +198,10 @@ func rowBlackRatioInTrack(buf *gocv.Mat, y int, xLeft int, xRight int) float64 {
 	return float64(blackCount) / float64(total)
 }
 
-func detectFinishLineInTrack(buf *gocv.Mat, scan ScanCandidate) bool {
+func detectFinishLineInTrack(buf *gocv.Mat, scan TrackScan) bool {
 	imgHeight := buf.Rows()
 
-	// Look inside the detected white track area.
-	// Slightly shrink the edges so black borders do not count.
+	// Shrink edges slightly so black borders do not count.
 	xLeft := scan.Start + 20
 	xRight := scan.End - 20
 
@@ -284,7 +220,7 @@ func detectFinishLineInTrack(buf *gocv.Mat, scan ScanCandidate) bool {
 	for y := startY; y < endY; y++ {
 		ratio := rowBlackRatioInTrack(buf, y, xLeft, xRight)
 
-		// Black finish bars should cover a big part of the white track.
+		// Finish line = black row across a big part of the white track.
 		isBlackRow := ratio > 0.38
 
 		if isBlackRow {
@@ -299,7 +235,6 @@ func detectFinishLineInTrack(buf *gocv.Mat, scan ScanCandidate) bool {
 				if bandHeight >= 2 && bandHeight <= 35 {
 					gap := y - lastBandEnd
 
-					// Count separate black bars.
 					if gap > 3 {
 						bandsFound++
 						lastBandEnd = y
@@ -370,6 +305,8 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 
 	sliceY := int(imgHeightFloat * 0.60)
 	preferredX := imgWidth / 2
+
+	// Based on your normal logs: usually around 420-540.
 	previousWidth := 490.0
 
 	for {
@@ -411,36 +348,39 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			kernel.Close()
 		}
 
-		scans := findTrackScans(&buf, preferredX, previousWidth, sliceY)
+		trackScan := findStableTrackScan(&buf, sliceY, preferredX, previousWidth)
 
 		finishLineDetected := false
 
-		if len(scans) > 0 {
-			best := scans[0]
-			middleX := (best.Start + best.End) / 2
-			width := best.End - best.Start
+		if trackScan != nil {
+			width := trackScan.End - trackScan.Start
+			middleX := (trackScan.Start + trackScan.End) / 2
 
 			preferredX = middleX
 			previousWidth = float64(width)
 
-			finishLineDetected = detectFinishLineInTrack(&buf, best)
+			finishLineDetected = detectFinishLineInTrack(&buf, *trackScan)
 
 			if finishLineDetected {
-				log.Info().Int("xLeft", best.Start).Int("xRight", best.End).Int("width", width).Msg("FINISH LINE DETECTED")
+				log.Info().
+					Int("xLeft", trackScan.Start).
+					Int("xRight", trackScan.End).
+					Int("width", width).
+					Msg("FINISH LINE DETECTED")
 			}
 		}
 
 		canvasObjects := make([]*pb_output.CanvasObject, 0)
 
-		for _, scan := range scans {
-			middleX := (scan.Start + scan.End) / 2
+		if trackScan != nil {
+			middleX := (trackScan.Start + trackScan.End) / 2
 
 			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
 				Object: &pb_output.CanvasObject_Circle_{
 					Circle: &pb_output.CanvasObject_Circle{
 						Center: &pb_output.CanvasObject_Point{
-							X: uint32(scan.Start),
-							Y: uint32(scan.Y),
+							X: uint32(trackScan.Start),
+							Y: uint32(trackScan.Y),
 						},
 						Radius: 1,
 					},
@@ -451,8 +391,8 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 				Object: &pb_output.CanvasObject_Circle_{
 					Circle: &pb_output.CanvasObject_Circle{
 						Center: &pb_output.CanvasObject_Point{
-							X: uint32(scan.End),
-							Y: uint32(scan.Y),
+							X: uint32(trackScan.End),
+							Y: uint32(trackScan.Y),
 						},
 						Radius: 1,
 					},
@@ -464,7 +404,7 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 					Circle: &pb_output.CanvasObject_Circle{
 						Center: &pb_output.CanvasObject_Point{
 							X: uint32(middleX),
-							Y: uint32(scan.Y),
+							Y: uint32(trackScan.Y),
 						},
 						Radius: 1,
 					},
@@ -490,27 +430,22 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 
 		horizontalScans := make([]*pb_output.HorizontalScan, 0)
 
-		if len(scans) > 0 {
-			best := scans[0]
-
-			scanY := uint32(best.Y)
+		if trackScan != nil {
+			scanY := uint32(trackScan.Y)
 
 			// Keep XLeft/XRight normal.
-			// Only mark finish line through Y.
+			// Only Y=9999 marks finish line for the logger.
 			if finishLineDetected {
 				scanY = 9999
 			}
 
-			// IMPORTANT:
-			// Send only ONE scan to the controller.
-			// Multiple scans make the car unstable.
 			horizontalScans = append(horizontalScans, &pb_output.HorizontalScan{
-				XLeft:  uint32(best.Start),
-				XRight: uint32(best.End),
+				XLeft:  uint32(trackScan.Start),
+				XRight: uint32(trackScan.End),
 				Y:      scanY,
 			})
 		} else {
-			log.Debug().Msg("No trajectory added")
+			log.Debug().Msg("No stable track scan found")
 		}
 
 		output := pb_output.SensorOutput{
