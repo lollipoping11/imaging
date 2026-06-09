@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"image"
+	"math"
 	"os"
 	"time"
 
@@ -20,6 +21,53 @@ type SliceDescriptor struct {
 }
 
 var thresholdValue int
+
+// PID Controller for smooth steering
+type PIDController struct {
+	Kp float64 // Proportional gain
+	Ki float64 // Integral gain
+	Kd float64 // Derivative gain
+
+	integral   float64
+	lastError  float64
+	lastOutput float64
+}
+
+func NewPIDController(kp, ki, kd float64) *PIDController {
+	return &PIDController{
+		Kp: kp,
+		Ki: ki,
+		Kd: kd,
+	}
+}
+
+func (pid *PIDController) Update(error float64, dt float64) float64 {
+	// Proportional term
+	proportional := pid.Kp * error
+
+	// Integral term with anti-windup
+	pid.integral += error * dt
+	// Clamp integral to prevent windup
+	if pid.integral > 100 {
+		pid.integral = 100
+	} else if pid.integral < -100 {
+		pid.integral = -100
+	}
+	integral := pid.Ki * pid.integral
+
+	// Derivative term
+	derivative := pid.Kd * (error - pid.lastError) / dt
+	pid.lastError = error
+
+	// Calculate output
+	output := proportional + integral + derivative
+
+	// Smooth with previous output (low-pass filter)
+	output = output*0.7 + pid.lastOutput*0.3
+	pid.lastOutput = output
+
+	return output
+}
 
 func verticalScanUp(image *gocv.Mat, x int, startY int) int {
 	y := startY
@@ -47,7 +95,7 @@ func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor 
 			}
 		} else {
 			if currentConsecutive != nil {
-				if currentConsecutive.End-currentConsecutive.Start > 5 { // Minimum 5px to avoid noise
+				if currentConsecutive.End-currentConsecutive.Start > 5 {
 					res = append(res, *currentConsecutive)
 				}
 				currentConsecutive = nil
@@ -62,23 +110,17 @@ func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor 
 	return res
 }
 
-// Improved glare handling with adaptive filtering
-func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferredX int, isCloseToCar bool) *SliceDescriptor {
+func getBestTrackSlice(sliceDescriptors []SliceDescriptor, preferredX int, trackWidth int) *SliceDescriptor {
 	if len(sliceDescriptors) == 0 {
 		return nil
 	}
 
-	// Adaptive filtering based on distance from car
-	minWidth := 15
-	maxWidth := 600
+	// Expected track width (can be adjusted based on camera height)
+	expectedWidth := trackWidth
+	minWidth := expectedWidth * 60 / 100  // 60% of expected
+	maxWidth := expectedWidth * 140 / 100 // 140% of expected
 
-	if isCloseToCar {
-		// Closer to car, track appears wider
-		minWidth = 30
-		maxWidth = 800
-	}
-
-	// Filter out glare (too wide) and noise (too narrow)
+	// Filter by realistic track width
 	filtered := []SliceDescriptor{}
 	for _, desc := range sliceDescriptors {
 		width := desc.End - desc.Start
@@ -88,32 +130,38 @@ func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferr
 	}
 
 	if len(filtered) == 0 {
+		// Fallback: accept any reasonable width
+		for _, desc := range sliceDescriptors {
+			width := desc.End - desc.Start
+			if width > 20 && width < 800 {
+				filtered = append(filtered, desc)
+			}
+		}
+	}
+
+	if len(filtered) == 0 {
 		return nil
 	}
 
-	// First try to find slice containing preferred X
-	for _, desc := range filtered {
-		if preferredX >= desc.Start && preferredX <= desc.End {
-			log.Debug().Int("preferredX", preferredX).Int("start", desc.Start).Int("end", desc.End).Msg("Found slice with preferred X")
-			return &desc
-		}
-	}
+	// Find slice closest to preferred X (weighted by size)
+	best := &filtered[0]
+	bestScore := float64(-1)
 
-	// If none contains preferred X, find closest to preferred X
-	closest := &filtered[0]
-	minDistance := abs(preferredX - (closest.Start+closest.End)/2)
-
-	for i := 1; i < len(filtered); i++ {
+	for i := range filtered {
 		centerX := (filtered[i].Start + filtered[i].End) / 2
-		distance := abs(preferredX - centerX)
-		if distance < minDistance {
-			minDistance = distance
-			closest = &filtered[i]
+		distance := float64(abs(preferredX - centerX))
+		width := filtered[i].End - filtered[i].Start
+
+		// Score: prioritize closeness, but also prefer wider tracks (more confident)
+		score := -distance + float64(width)/10.0
+
+		if score > bestScore {
+			bestScore = score
+			best = &filtered[i]
 		}
 	}
 
-	log.Debug().Int("preferredX", preferredX).Int("selectedCenter", (closest.Start+closest.End)/2).Msg("Selected closest slice")
-	return closest
+	return best
 }
 
 func abs(x int) int {
@@ -123,7 +171,6 @@ func abs(x int) int {
 	return x
 }
 
-// Check for finish line (two black lines in the middle)
 func checkFinishLine(img *gocv.Mat, y int) bool {
 	if img.Empty() {
 		return false
@@ -136,31 +183,39 @@ func checkFinishLine(img *gocv.Mat, y int) bool {
 		return false
 	}
 
-	// Scan a horizontal line at given Y
 	row := img.Row(y)
 	defer row.Close()
 
-	// Look for two distinct black regions in the middle third of the image
+	// Look for two distinct black regions in the middle third
 	middleStart := width / 3
 	middleEnd := 2 * width / 3
 
 	blackRegions := 0
 	inBlackRegion := false
+	regionStart := 0
 
 	for x := middleStart; x < middleEnd; x++ {
 		pixel := row.GetUCharAt(0, x)
-		if pixel == 0 { // Black pixel
+		if pixel == 0 {
 			if !inBlackRegion {
 				blackRegions++
+				regionStart = x
 				inBlackRegion = true
 			}
 		} else {
-			inBlackRegion = false
+			if inBlackRegion {
+				regionWidth := x - regionStart
+				// Each black line should be substantial (not just noise)
+				if regionWidth < 5 {
+					blackRegions-- // Too small, not a real line
+				}
+				inBlackRegion = false
+			}
 		}
 	}
 
-	// Finish line detected if we have 2 distinct black regions (the two black lines)
-	return blackRegions >= 2
+	// Need exactly 2 substantial black regions
+	return blackRegions == 2
 }
 
 func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration) error {
@@ -214,15 +269,25 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 	buf := gocv.NewMat()
 	defer buf.Close()
 
-	sliceY := int(imgHeightFloat * 0.60)
-	preferredX := imgWidth / 2
+	// PID controller for steering (tuned for smooth driving)
+	pid := NewPIDController(0.15, 0.01, 0.05)
 
-	// Track following variables
+	// Track variables
+	preferredX := imgWidth / 2
 	lastValidMiddleX := preferredX
 	consecutiveLostFrames := 0
-	maxLostFrames := 10
+	maxLostFrames := 15
+
+	// Track width tracking for better filtering
+	avgTrackWidth := 300 // Start with reasonable default
+	widthAlpha := 0.3    // Smoothing factor
+
+	// For PID timing
+	lastTime := time.Now()
 
 	for {
+		frameStart := time.Now()
+
 		if ok := cam.Read(&buf); !ok {
 			log.Warn().Msg("Error reading from camera")
 			continue
@@ -234,8 +299,6 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		currentWidth := buf.Cols()
 		currentHeight := buf.Rows()
 
-		log.Debug().Int("width", currentWidth).Int("height", currentHeight).Msg("Read image")
-
 		newThreshold, err := configuration.GetFloat("threshold-value")
 		if err != nil {
 			log.Err(err).Msg("Failed to get threshold value from tuning")
@@ -246,119 +309,187 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		}
 
 		if thresholdValue > 0 {
-			// Convert to grayscale
 			gocv.CvtColor(buf, &buf, gocv.ColorBGRToGray)
-			// Apply adaptive threshold for better glare handling
-			gocv.AdaptiveThreshold(buf, &buf, 255, gocv.AdaptiveThresholdMean, gocv.ThresholdBinary, 51, 10)
+			// Use adaptive threshold for better lighting handling
+			gocv.AdaptiveThreshold(buf, &buf, 255, gocv.AdaptiveThresholdGaussian, gocv.ThresholdBinary, 51, 8)
 
-			// Morphological operations to clean up
+			// Clean up noise
 			kernel := gocv.GetStructuringElement(gocv.MorphRect, image.Pt(3, 3))
 			gocv.MorphologyEx(buf, &buf, gocv.MorphClose, kernel)
 			gocv.Erode(buf, &buf, kernel)
-			gocv.Dilate(buf, &buf, kernel)
 			kernel.Close()
 		}
 
-		// Check for finish line first
+		// Check for finish line
 		finishLineDetected := false
-		finishY := currentHeight - 20 // Check near bottom of image
-
-		// Scan multiple Y positions for finish line
 		for yOffset := 0; yOffset < 40; yOffset += 10 {
-			if checkFinishLine(&buf, finishY-yOffset) {
+			if checkFinishLine(&buf, currentHeight-20-yOffset) {
 				finishLineDetected = true
 				break
 			}
 		}
 
-		var longestConsecutive *SliceDescriptor = nil
-		var foundSliceY int = sliceY
+		// Multi-line scan for better track detection
+		type TrackSample struct {
+			Y      int
+			Center int
+			Width  int
+		}
 
-		// Start scanning from bottom up
-		startY := currentHeight - 20
-		scanStep := 5 // Smaller steps for better detection
+		samples := []TrackSample{}
 
-		// Multi-scan with fallback
-		for y := startY; y > sliceY && longestConsecutive == nil; y -= scanStep {
-			if y >= currentHeight {
+		// Scan multiple horizontal lines, weighted by importance
+		scanLines := []int{
+			currentHeight - 20, // Very close (most important)
+			currentHeight - 40,
+			currentHeight - 60,
+			currentHeight - 80,
+			currentHeight - 100,
+			currentHeight - 120,
+		}
+
+		for _, y := range scanLines {
+			if y < 0 || y >= currentHeight {
 				continue
 			}
 
 			horizontalSlice := buf.Region(image.Rect(0, y, currentWidth, y+1))
 			sliceDescriptors := getConsecutiveWhitePointsFromSlice(&horizontalSlice)
 
-			// Check if we're close to the car (bottom of image)
-			isCloseToCar := y > currentHeight-50
-			longestConsecutive = getLongestConsecutiveWhiteSlice(sliceDescriptors, preferredX, isCloseToCar)
+			// Get best slice at this Y
+			bestSlice := getBestTrackSlice(sliceDescriptors, preferredX, avgTrackWidth)
 
-			if longestConsecutive != nil {
-				foundSliceY = y
+			if bestSlice != nil {
+				centerX := (bestSlice.Start + bestSlice.End) / 2
+				width := bestSlice.End - bestSlice.Start
+				samples = append(samples, TrackSample{Y: y, Center: centerX, Width: width})
 			}
+
 			horizontalSlice.Close()
 		}
 
-		// If no track found in first pass, try wider scan
-		if longestConsecutive == nil {
-			consecutiveLostFrames++
-			log.Warn().Int("consecutiveLost", consecutiveLostFrames).Msg("No track detected")
+		var targetX int
+		var foundTrack bool
 
-			// Use last known good position with gradual recovery
-			if consecutiveLostFrames < maxLostFrames {
-				// Use last valid middle X
-				preferredX = lastValidMiddleX
-			} else {
-				// Completely lost - reset to center
-				preferredX = currentWidth / 2
-				consecutiveLostFrames = maxLostFrames // Stay at center until track found
-			}
-		} else {
+		if len(samples) > 0 {
 			consecutiveLostFrames = 0
-			middleX := (longestConsecutive.Start + longestConsecutive.End) / 2
+			foundTrack = true
 
-			// Smooth the steering (avoid jerky movements)
-			preferredX = (preferredX*3 + middleX) / 4
+			// Weighted average based on Y position (closer = more important)
+			totalWeight := 0.0
+			weightedSum := 0.0
+
+			for _, sample := range samples {
+				// Weight: closer to car is exponentially more important
+				distanceFromCar := currentHeight - sample.Y
+				weight := math.Exp(-float64(distanceFromCar) / 50.0) // Decay over 50 pixels
+
+				weightedSum += float64(sample.Center) * weight
+				totalWeight += weight
+
+				// Update average track width
+				avgTrackWidth = int(float64(avgTrackWidth)*(1-widthAlpha) + float64(sample.Width)*widthAlpha)
+			}
+
+			if totalWeight > 0 {
+				targetX = int(weightedSum / totalWeight)
+			} else {
+				targetX = samples[0].Center
+			}
+
+			// Smooth the target
+			preferredX = preferredX*70/100 + targetX*30/100
 			lastValidMiddleX = preferredX
+
+		} else {
+			consecutiveLostFrames++
+			foundTrack = false
+
+			if consecutiveLostFrames < maxLostFrames {
+				// Use last known position, gradually drift to center
+				preferredX = lastValidMiddleX*80/100 + (currentWidth/2)*20/100
+			} else {
+				// Completely lost, reset to center
+				preferredX = currentWidth / 2
+			}
+		}
+
+		// Calculate steering error (normalized -1 to 1)
+		imageCenter := currentWidth / 2
+		maxError := currentWidth / 3 // Max error for full steering
+		rawError := float64(preferredX-imageCenter) / float64(maxError)
+
+		// Clamp error
+		if rawError > 1.0 {
+			rawError = 1.0
+		} else if rawError < -1.0 {
+			rawError = -1.0
+		}
+
+		// Dead zone - ignore small errors to prevent wobble
+		deadZone := 0.05
+		if math.Abs(rawError) < deadZone {
+			rawError = 0
+		}
+
+		// Apply PID for smooth steering
+		dt := time.Since(lastTime).Seconds()
+		if dt > 0.1 {
+			dt = 0.1 // Cap dt
+		}
+		steeringOutput := pid.Update(rawError, dt)
+
+		// Clamp steering output
+		if steeringOutput > 1.0 {
+			steeringOutput = 1.0
+		} else if steeringOutput < -1.0 {
+			steeringOutput = -1.0
+		}
+
+		lastTime = time.Now()
+
+		// Log steering info
+		if foundTrack {
+			log.Debug().
+				Float64("error", rawError).
+				Float64("steering", steeringOutput).
+				Int("targetX", preferredX).
+				Int("samples", len(samples)).
+				Int("trackWidth", avgTrackWidth).
+				Msg("Steering")
+		} else {
+			log.Debug().Int("lostFrames", consecutiveLostFrames).Msg("Track lost")
 		}
 
 		// Prepare canvas for debugging
 		canvasObjects := make([]*pb_output.CanvasObject, 0)
 
-		if longestConsecutive != nil {
-			middleX := (longestConsecutive.Start + longestConsecutive.End) / 2
+		// Draw track samples
+		for _, sample := range samples {
+			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
+				Object: &pb_output.CanvasObject_Circle_{
+					Circle: &pb_output.CanvasObject_Circle{
+						Center: &pb_output.CanvasObject_Point{
+							X: uint32(sample.Center),
+							Y: uint32(sample.Y),
+						},
+						Radius: 3,
+					},
+				},
+			})
+		}
 
-			// Draw track boundaries
-			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
-				Object: &pb_output.CanvasObject_Circle_{
-					Circle: &pb_output.CanvasObject_Circle{
-						Center: &pb_output.CanvasObject_Point{
-							X: uint32(longestConsecutive.Start),
-							Y: uint32(foundSliceY),
-						},
-						Radius: 3,
-					},
-				},
-			})
-			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
-				Object: &pb_output.CanvasObject_Circle_{
-					Circle: &pb_output.CanvasObject_Circle{
-						Center: &pb_output.CanvasObject_Point{
-							X: uint32(longestConsecutive.End),
-							Y: uint32(foundSliceY),
-						},
-						Radius: 3,
-					},
-				},
-			})
-			// Draw center line
+		// Draw target line
+		if foundTrack {
 			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
 				Object: &pb_output.CanvasObject_Line_{
 					Line: &pb_output.CanvasObject_Line{
 						Start: &pb_output.CanvasObject_Point{
-							X: uint32(middleX),
-							Y: uint32(foundSliceY),
+							X: uint32(preferredX),
+							Y: uint32(currentHeight - 20),
 						},
 						End: &pb_output.CanvasObject_Point{
-							X: uint32(middleX),
+							X: uint32(preferredX),
 							Y: uint32(currentHeight),
 						},
 					},
@@ -366,7 +497,22 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			})
 		}
 
-		// Add finish line indication to canvas if detected
+		// Draw center line
+		canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
+			Object: &pb_output.CanvasObject_Line_{
+				Line: &pb_output.CanvasObject_Line{
+					Start: &pb_output.CanvasObject_Point{
+						X: uint32(imageCenter),
+						Y: 0,
+					},
+					End: &pb_output.CanvasObject_Point{
+						X: uint32(imageCenter),
+						Y: uint32(currentHeight),
+					},
+				},
+			},
+		})
+
 		if finishLineDetected {
 			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
 				Object: &pb_output.CanvasObject_Text_{
@@ -381,39 +527,50 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			})
 		}
 
+		// Add steering indicator
+		steeringX := imageCenter + int(steeringOutput*float64(currentWidth)/4)
+		canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
+			Object: &pb_output.CanvasObject_Circle_{
+				Circle: &pb_output.CanvasObject_Circle{
+					Center: &pb_output.CanvasObject_Point{
+						X: uint32(steeringX),
+						Y: uint32(currentHeight - 10),
+					},
+					Radius: 5,
+				},
+			},
+		})
+
 		canvas := pb_output.Canvas{
 			Objects: canvasObjects,
 			Width:   uint32(currentWidth),
 			Height:  uint32(currentHeight),
 		}
 
-		// Encode image with lower quality for bandwidth
-		compressionParams := []int{gocv.IMWriteJpegQuality, 30}
+		compressionParams := []int{gocv.IMWriteJpegQuality, 25}
 		imgBytes, err := gocv.IMEncodeWithParams(".jpg", buf, compressionParams)
 		if err != nil {
 			log.Err(err).Msg("Error encoding image")
-			return err
+			continue
 		}
 
 		horizontalScans := make([]*pb_output.HorizontalScan, 0)
 
 		if finishLineDetected {
-			// Special scan to indicate finish line (Y=9999 as expected by logger)
 			horizontalScans = append(horizontalScans, &pb_output.HorizontalScan{
 				XLeft:  0,
 				XRight: uint32(currentWidth),
-				Y:      9999, // Special value for finish line detection
+				Y:      9999,
 			})
-			log.Info().Msg("FINISH LINE DETECTED - Sending to logger")
-		} else if longestConsecutive != nil {
-			// Normal track scan
+			log.Info().Msg("FINISH LINE DETECTED")
+		} else if foundTrack && len(samples) > 0 {
+			// Send the closest scan for driving
+			closestSample := samples[len(samples)-1]
 			horizontalScans = append(horizontalScans, &pb_output.HorizontalScan{
-				XLeft:  uint32(longestConsecutive.Start),
-				XRight: uint32(longestConsecutive.End),
-				Y:      uint32(foundSliceY),
+				XLeft:  uint32(closestSample.Center - closestSample.Width/2),
+				XRight: uint32(closestSample.Center + closestSample.Width/2),
+				Y:      uint32(closestSample.Y),
 			})
-		} else {
-			log.Debug().Msg("No trajectory added")
 		}
 
 		output := pb_output.SensorOutput{
@@ -448,7 +605,11 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			return err
 		}
 
-		log.Debug().Bool("finishLine", finishLineDetected).Int("preferredX", preferredX).Msg("Sent image")
+		// Maintain stable framerate
+		frameTime := time.Since(frameStart)
+		if frameTime < 33*time.Millisecond { // ~30 FPS
+			time.Sleep(33*time.Millisecond - frameTime)
+		}
 	}
 }
 
