@@ -114,7 +114,7 @@ func getTrackScanAtY(buf *gocv.Mat, y int, preferredX int, previousWidth float64
 	// Hard limits:
 	// Too small = noise/glare patch.
 	// Too large = glare/washed-out image.
-	if width < 180 {
+	if width < 320 {
 		return nil
 	}
 
@@ -125,8 +125,8 @@ func getTrackScanAtY(buf *gocv.Mat, y int, preferredX int, previousWidth float64
 	// Adaptive limits:
 	// Generous so corners are not skipped.
 	if previousWidth > 0 {
-		minAllowed := previousWidth * 0.60
-		maxAllowed := previousWidth * 1.40
+		minAllowed := previousWidth * 0.75
+		maxAllowed := previousWidth * 1.25
 
 		if float64(width) < minAllowed || float64(width) > maxAllowed {
 			return nil
