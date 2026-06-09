@@ -47,7 +47,7 @@ func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor 
 			}
 		} else {
 			if currentConsecutive != nil {
-				if currentConsecutive.End-currentConsecutive.Start > 0 {
+				if currentConsecutive.End-currentConsecutive.Start > 5 { // Minimum 5px to avoid noise
 					res = append(res, *currentConsecutive)
 				}
 				currentConsecutive = nil
@@ -55,24 +55,34 @@ func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor 
 		}
 	}
 
-	if currentConsecutive != nil && currentConsecutive.End-currentConsecutive.Start > 0 {
+	if currentConsecutive != nil && currentConsecutive.End-currentConsecutive.Start > 5 {
 		res = append(res, *currentConsecutive)
 	}
 
 	return res
 }
 
-// FIX 1: Added glare width filter back (reject <20px noise and >500px glare)
-func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferredX int) *SliceDescriptor {
+// Improved glare handling with adaptive filtering
+func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferredX int, isCloseToCar bool) *SliceDescriptor {
 	if len(sliceDescriptors) == 0 {
 		return nil
+	}
+
+	// Adaptive filtering based on distance from car
+	minWidth := 15
+	maxWidth := 600
+
+	if isCloseToCar {
+		// Closer to car, track appears wider
+		minWidth = 30
+		maxWidth = 800
 	}
 
 	// Filter out glare (too wide) and noise (too narrow)
 	filtered := []SliceDescriptor{}
 	for _, desc := range sliceDescriptors {
 		width := desc.End - desc.Start
-		if width > 20 && width < 500 {
+		if width > minWidth && width < maxWidth {
 			filtered = append(filtered, desc)
 		}
 	}
@@ -81,18 +91,76 @@ func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferr
 		return nil
 	}
 
-	longest := filtered[0]
+	// First try to find slice containing preferred X
 	for _, desc := range filtered {
-		if preferredX > desc.Start && preferredX < desc.End {
-			log.Debug().Int("preferredX", preferredX).Msg("Returned slice containing preferred X")
+		if preferredX >= desc.Start && preferredX <= desc.End {
+			log.Debug().Int("preferredX", preferredX).Int("start", desc.Start).Int("end", desc.End).Msg("Found slice with preferred X")
 			return &desc
-		}
-		if (desc.End - desc.Start) > (longest.End - longest.Start) {
-			longest = desc
 		}
 	}
 
-	return &longest
+	// If none contains preferred X, find closest to preferred X
+	closest := &filtered[0]
+	minDistance := abs(preferredX - (closest.Start+closest.End)/2)
+
+	for i := 1; i < len(filtered); i++ {
+		centerX := (filtered[i].Start + filtered[i].End) / 2
+		distance := abs(preferredX - centerX)
+		if distance < minDistance {
+			minDistance = distance
+			closest = &filtered[i]
+		}
+	}
+
+	log.Debug().Int("preferredX", preferredX).Int("selectedCenter", (closest.Start+closest.End)/2).Msg("Selected closest slice")
+	return closest
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// Check for finish line (two black lines in the middle)
+func checkFinishLine(img *gocv.Mat, y int) bool {
+	if img.Empty() {
+		return false
+	}
+
+	width := img.Cols()
+	height := img.Rows()
+
+	if y >= height {
+		return false
+	}
+
+	// Scan a horizontal line at given Y
+	row := img.Row(y)
+	defer row.Close()
+
+	// Look for two distinct black regions in the middle third of the image
+	middleStart := width / 3
+	middleEnd := 2 * width / 3
+
+	blackRegions := 0
+	inBlackRegion := false
+
+	for x := middleStart; x < middleEnd; x++ {
+		pixel := row.GetUCharAt(0, x)
+		if pixel == 0 { // Black pixel
+			if !inBlackRegion {
+				blackRegions++
+				inBlackRegion = true
+			}
+		} else {
+			inBlackRegion = false
+		}
+	}
+
+	// Finish line detected if we have 2 distinct black regions (the two black lines)
+	return blackRegions >= 2
 }
 
 func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration) error {
@@ -132,7 +200,6 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 	gstPipeline = fmt.Sprintf(gstPipeline, imgWidth, imgHeight, imgFps)
 	log.Info().Str("pipeline", gstPipeline).Msg("Using gstreamer pipeline")
 
-	// FIX 2: Added null check for imageOutput
 	imageOutput := service.GetWriteStream("path")
 	if imageOutput == nil {
 		return fmt.Errorf("failed to get write stream 'path'")
@@ -150,6 +217,11 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 	sliceY := int(imgHeightFloat * 0.60)
 	preferredX := imgWidth / 2
 
+	// Track following variables
+	lastValidMiddleX := preferredX
+	consecutiveLostFrames := 0
+	maxLostFrames := 10
+
 	for {
 		if ok := cam.Read(&buf); !ok {
 			log.Warn().Msg("Error reading from camera")
@@ -158,10 +230,11 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		if buf.Empty() {
 			continue
 		}
-		imgWidth := buf.Cols()
-		imgHeight := buf.Rows()
 
-		log.Debug().Int("width", imgWidth).Int("height", imgHeight).Msg("Read image")
+		currentWidth := buf.Cols()
+		currentHeight := buf.Rows()
+
+		log.Debug().Int("width", currentWidth).Int("height", currentHeight).Msg("Read image")
 
 		newThreshold, err := configuration.GetFloat("threshold-value")
 		if err != nil {
@@ -173,59 +246,87 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		}
 
 		if thresholdValue > 0 {
+			// Convert to grayscale
 			gocv.CvtColor(buf, &buf, gocv.ColorBGRToGray)
-			gocv.Threshold(buf, &buf, float32(thresholdValue), 255.0, gocv.ThresholdBinary+gocv.ThresholdOtsu)
-			kernel := gocv.GetStructuringElement(gocv.MorphRect, image.Pt(5, 5))
-			gocv.Dilate(buf, &buf, kernel)
+			// Apply adaptive threshold for better glare handling
+			gocv.AdaptiveThreshold(buf, &buf, 255, gocv.AdaptiveThresholdMean, gocv.ThresholdBinary, 51, 10)
+
+			// Morphological operations to clean up
+			kernel := gocv.GetStructuringElement(gocv.MorphRect, image.Pt(3, 3))
+			gocv.MorphologyEx(buf, &buf, gocv.MorphClose, kernel)
 			gocv.Erode(buf, &buf, kernel)
+			gocv.Dilate(buf, &buf, kernel)
 			kernel.Close()
+		}
+
+		// Check for finish line first
+		finishLineDetected := false
+		finishY := currentHeight - 20 // Check near bottom of image
+
+		// Scan multiple Y positions for finish line
+		for yOffset := 0; yOffset < 40; yOffset += 10 {
+			if checkFinishLine(&buf, finishY-yOffset) {
+				finishLineDetected = true
+				break
+			}
 		}
 
 		var longestConsecutive *SliceDescriptor = nil
 		var foundSliceY int = sliceY
 
-		newBarY := verticalScanUp(&buf, preferredX, imgHeight-10) + 2
-		if newBarY >= imgHeight {
-			newBarY = imgHeight - 1
-		}
+		// Start scanning from bottom up
+		startY := currentHeight - 20
+		scanStep := 5 // Smaller steps for better detection
 
-		usedSlice := uint32(newBarY)
-		if usedSlice < uint32(sliceY) {
-			usedSlice = uint32(sliceY)
-		}
-
-		// FIX 3: Multi-scan using usedSlice not fixed sliceY
-		// FIX 4: Removed overly strict minimum width of 320px
-		// The glare filter in getLongestConsecutiveWhiteSlice handles bad regions
-		for uint32(usedSlice) < (uint32(imgHeight)-1) && (longestConsecutive == nil) {
-			usedSlice += 10
-
-			if int(usedSlice) >= imgHeight-1 {
-				break
+		// Multi-scan with fallback
+		for y := startY; y > sliceY && longestConsecutive == nil; y -= scanStep {
+			if y >= currentHeight {
+				continue
 			}
 
-			horizontalSlice := buf.Region(image.Rect(0, int(usedSlice), imgWidth, int(usedSlice)+1))
+			horizontalSlice := buf.Region(image.Rect(0, y, currentWidth, y+1))
 			sliceDescriptors := getConsecutiveWhitePointsFromSlice(&horizontalSlice)
-			longestConsecutive = getLongestConsecutiveWhiteSlice(sliceDescriptors, preferredX)
 
-			if longestConsecutive != nil && (preferredX < longestConsecutive.Start || preferredX > longestConsecutive.End) {
-				longestConsecutive = nil
-			} else if longestConsecutive != nil {
-				foundSliceY = int(usedSlice)
+			// Check if we're close to the car (bottom of image)
+			isCloseToCar := y > currentHeight-50
+			longestConsecutive = getLongestConsecutiveWhiteSlice(sliceDescriptors, preferredX, isCloseToCar)
+
+			if longestConsecutive != nil {
+				foundSliceY = y
 			}
 			horizontalSlice.Close()
 		}
 
-		// Update preferredX only when track is found
-		if longestConsecutive != nil {
+		// If no track found in first pass, try wider scan
+		if longestConsecutive == nil {
+			consecutiveLostFrames++
+			log.Warn().Int("consecutiveLost", consecutiveLostFrames).Msg("No track detected")
+
+			// Use last known good position with gradual recovery
+			if consecutiveLostFrames < maxLostFrames {
+				// Use last valid middle X
+				preferredX = lastValidMiddleX
+			} else {
+				// Completely lost - reset to center
+				preferredX = currentWidth / 2
+				consecutiveLostFrames = maxLostFrames // Stay at center until track found
+			}
+		} else {
+			consecutiveLostFrames = 0
 			middleX := (longestConsecutive.Start + longestConsecutive.End) / 2
-			preferredX = middleX
+
+			// Smooth the steering (avoid jerky movements)
+			preferredX = (preferredX*3 + middleX) / 4
+			lastValidMiddleX = preferredX
 		}
 
+		// Prepare canvas for debugging
 		canvasObjects := make([]*pb_output.CanvasObject, 0)
+
 		if longestConsecutive != nil {
 			middleX := (longestConsecutive.Start + longestConsecutive.End) / 2
 
+			// Draw track boundaries
 			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
 				Object: &pb_output.CanvasObject_Circle_{
 					Circle: &pb_output.CanvasObject_Circle{
@@ -233,7 +334,7 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 							X: uint32(longestConsecutive.Start),
 							Y: uint32(foundSliceY),
 						},
-						Radius: 1,
+						Radius: 3,
 					},
 				},
 			})
@@ -244,18 +345,37 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 							X: uint32(longestConsecutive.End),
 							Y: uint32(foundSliceY),
 						},
-						Radius: 1,
+						Radius: 3,
 					},
 				},
 			})
+			// Draw center line
 			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
-				Object: &pb_output.CanvasObject_Circle_{
-					Circle: &pb_output.CanvasObject_Circle{
-						Center: &pb_output.CanvasObject_Point{
+				Object: &pb_output.CanvasObject_Line_{
+					Line: &pb_output.CanvasObject_Line{
+						Start: &pb_output.CanvasObject_Point{
 							X: uint32(middleX),
 							Y: uint32(foundSliceY),
 						},
-						Radius: 1,
+						End: &pb_output.CanvasObject_Point{
+							X: uint32(middleX),
+							Y: uint32(currentHeight),
+						},
+					},
+				},
+			})
+		}
+
+		// Add finish line indication to canvas if detected
+		if finishLineDetected {
+			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
+				Object: &pb_output.CanvasObject_Text_{
+					Text: &pb_output.CanvasObject_Text{
+						Content: "FINISH LINE",
+						Position: &pb_output.CanvasObject_Point{
+							X: 10,
+							Y: 30,
+						},
 					},
 				},
 			})
@@ -263,21 +383,30 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 
 		canvas := pb_output.Canvas{
 			Objects: canvasObjects,
-			Width:   uint32(imgWidth),
-			Height:  uint32(imgHeight),
+			Width:   uint32(currentWidth),
+			Height:  uint32(currentHeight),
 		}
 
-		var compressionParams [2]int
-		compressionParams[0] = gocv.IMWriteJpegQuality
-		compressionParams[1] = 30
-		imgBytes, err := gocv.IMEncodeWithParams(".jpg", buf, compressionParams[:])
+		// Encode image with lower quality for bandwidth
+		compressionParams := []int{gocv.IMWriteJpegQuality, 30}
+		imgBytes, err := gocv.IMEncodeWithParams(".jpg", buf, compressionParams)
 		if err != nil {
 			log.Err(err).Msg("Error encoding image")
 			return err
 		}
 
 		horizontalScans := make([]*pb_output.HorizontalScan, 0)
-		if longestConsecutive != nil {
+
+		if finishLineDetected {
+			// Special scan to indicate finish line (Y=9999 as expected by logger)
+			horizontalScans = append(horizontalScans, &pb_output.HorizontalScan{
+				XLeft:  0,
+				XRight: uint32(currentWidth),
+				Y:      9999, // Special value for finish line detection
+			})
+			log.Info().Msg("FINISH LINE DETECTED - Sending to logger")
+		} else if longestConsecutive != nil {
+			// Normal track scan
 			horizontalScans = append(horizontalScans, &pb_output.HorizontalScan{
 				XLeft:  uint32(longestConsecutive.Start),
 				XRight: uint32(longestConsecutive.End),
@@ -293,8 +422,8 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			SensorOutput: &pb_output.SensorOutput_CameraOutput{
 				CameraOutput: &pb_output.CameraSensorOutput{
 					Resolution: &pb_output.Resolution{
-						Width:  uint32(imgWidth),
-						Height: uint32(imgHeight),
+						Width:  uint32(currentWidth),
+						Height: uint32(currentHeight),
 					},
 					DebugFrame: &pb_output.DebugFrame{
 						Jpeg:   imgBytes.GetBytes(),
@@ -304,6 +433,7 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 				},
 			},
 		}
+
 		outputBytes, err := proto.Marshal(&output)
 		imgBytes.Close()
 
@@ -318,7 +448,7 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			return err
 		}
 
-		log.Debug().Msg("Sent image")
+		log.Debug().Bool("finishLine", finishLineDetected).Int("preferredX", preferredX).Msg("Sent image")
 	}
 }
 
