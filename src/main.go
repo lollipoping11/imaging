@@ -151,7 +151,7 @@ func findStableTrackScan(buf *gocv.Mat, sliceY int, preferredX int, previousWidt
 
 	// Only if normal scan looks bad, try nearby backup lines.
 	// Closest first to keep driving behavior close to base imaging.
-	offsets := []int{-20, 20, -40, 40, -60, 60, -80, 80}
+	offsets := []int{-15, 15, -30, 30}
 
 	for _, offset := range offsets {
 		y := sliceY + offset
@@ -356,8 +356,11 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			width := trackScan.End - trackScan.Start
 			middleX := (trackScan.Start + trackScan.End) / 2
 
-			preferredX = middleX
-			previousWidth = float64(width)
+			// Smooth center update so one bad frame does not yank steering.
+			preferredX = int(0.75*float64(preferredX) + 0.25*float64(middleX))
+
+			// Smooth width too.
+			previousWidth = 0.80*previousWidth + 0.20*float64(width)
 
 			finishLineDetected = detectFinishLineInTrack(&buf, *trackScan)
 
