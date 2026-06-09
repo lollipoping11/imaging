@@ -294,13 +294,11 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 
 		horizontal_scans := make([]*pb_output.HorizontalScan, 0)
 		if finishLineDetected && longestConsecutive != nil {
-			// Send BOTH: magic finish line signal AND normal track data
 			horizontal_scans = append(horizontal_scans, &pb_output.HorizontalScan{
-				XLeft:  9999,
+				XLeft:  uint32(longestConsecutive.Start),
 				XRight: uint32(longestConsecutive.End),
-				Y:      uint32(foundSliceY),
+				Y:      9999, // magic value — Y=9999 means finish line
 			})
-		} else if longestConsecutive != nil {
 		} else if longestConsecutive != nil {
 			horizontal_scans = append(horizontal_scans, &pb_output.HorizontalScan{
 				XLeft:  uint32(longestConsecutive.Start),
