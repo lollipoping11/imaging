@@ -21,6 +21,12 @@ type SliceDescriptor struct {
 
 var thresholdValue int
 
+// Track width tracking variables
+var minTrackWidth int = 80  // Minimum expected track width
+var maxTrackWidth int = 400 // Maximum expected track width
+var widthConfidence int = 0 // How confident we are in the current range
+var validWidths []int       // Store recent valid widths
+
 func verticalScanUp(image *gocv.Mat, x int, startY int) int {
 	y := startY
 	for y >= 0 {
@@ -62,7 +68,106 @@ func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor 
 	return res
 }
 
-// NEW: Detect if we're at an intersection (multiple track segments with gaps)
+// Update the track width range based on valid measurements
+func updateTrackWidthRange(width int) {
+	if width < 20 || width > 800 {
+		return // Ignore obviously wrong values
+	}
+
+	// Store recent valid widths (keep last 20)
+	validWidths = append(validWidths, width)
+	if len(validWidths) > 20 {
+		validWidths = validWidths[1:]
+	}
+
+	// Calculate average of recent widths
+	if len(validWidths) > 5 {
+		sum := 0
+		for _, w := range validWidths {
+			sum += w
+		}
+		avgWidth := sum / len(validWidths)
+
+		// Set acceptable range: 60% to 140% of average
+		minTrackWidth = avgWidth * 60 / 100
+		maxTrackWidth = avgWidth * 140 / 100
+
+		// Clamp to reasonable absolute limits
+		if minTrackWidth < 40 {
+			minTrackWidth = 40
+		}
+		if maxTrackWidth > 600 {
+			maxTrackWidth = 600
+		}
+
+		widthConfidence++
+		if widthConfidence > 10 {
+			widthConfidence = 10
+		}
+
+		log.Debug().Int("width", width).Int("avg", avgWidth).Int("min", minTrackWidth).Int("max", maxTrackWidth).Msg("Track width range updated")
+	}
+}
+
+// MODIFIED: Width-based filter to eliminate glare
+func getValidTrackSlice(sliceDescriptors []SliceDescriptor, preferredX int) *SliceDescriptor {
+	if len(sliceDescriptors) == 0 {
+		return nil
+	}
+
+	// First pass: Filter by width range (eliminates glare)
+	filtered := []SliceDescriptor{}
+	for _, desc := range sliceDescriptors {
+		width := desc.End - desc.Start
+
+		// Use dynamic width range if we have confidence, otherwise use default
+		if widthConfidence > 3 {
+			// We have learned the track width
+			if width >= minTrackWidth && width <= maxTrackWidth {
+				filtered = append(filtered, desc)
+			} else {
+				log.Debug().Int("width", width).Int("min", minTrackWidth).Int("max", maxTrackWidth).Msg("Filtered out by width")
+			}
+		} else {
+			// Still learning - use generous defaults
+			if width > 30 && width < 500 {
+				filtered = append(filtered, desc)
+			}
+		}
+	}
+
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	// Try to find slice containing preferred X first
+	for _, desc := range filtered {
+		if preferredX >= desc.Start && preferredX <= desc.End {
+			// Update track width range with this valid measurement
+			updateTrackWidthRange(desc.End - desc.Start)
+			return &desc
+		}
+	}
+
+	// If none contains preferred X, find closest
+	closest := &filtered[0]
+	minDistance := abs(preferredX - (closest.Start+closest.End)/2)
+
+	for i := 1; i < len(filtered); i++ {
+		centerX := (filtered[i].Start + filtered[i].End) / 2
+		distance := abs(preferredX - centerX)
+		if distance < minDistance {
+			minDistance = distance
+			closest = &filtered[i]
+		}
+	}
+
+	// Update track width range with this valid measurement
+	updateTrackWidthRange(closest.End - closest.Start)
+	return closest
+}
+
+// Detect if we're at an intersection (multiple track segments)
 func isIntersection(sliceDescriptors []SliceDescriptor, minGap int) bool {
 	if len(sliceDescriptors) >= 2 {
 		for i := 0; i < len(sliceDescriptors)-1; i++ {
@@ -75,7 +180,7 @@ func isIntersection(sliceDescriptors []SliceDescriptor, minGap int) bool {
 	return false
 }
 
-// NEW: Find the straight path (closest to image center) at intersections
+// Find the straight path (closest to image center) at intersections
 func getStraightPath(sliceDescriptors []SliceDescriptor, imageWidth int) *SliceDescriptor {
 	if len(sliceDescriptors) == 0 {
 		return nil
@@ -102,48 +207,6 @@ func abs(x int) int {
 		return -x
 	}
 	return x
-}
-
-// MODIFIED: Added intersection detection
-func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferredX int, imageWidth int) *SliceDescriptor {
-	if len(sliceDescriptors) == 0 {
-		return nil
-	}
-
-	// NEW: If we're at an intersection, take the straight path instead of longest
-	if isIntersection(sliceDescriptors, 30) {
-		log.Debug().Msg("Intersection detected - taking straight path")
-		straightPath := getStraightPath(sliceDescriptors, imageWidth)
-		if straightPath != nil {
-			return straightPath
-		}
-	}
-
-	// Filter out glare (too wide) and noise (too narrow)
-	filtered := []SliceDescriptor{}
-	for _, desc := range sliceDescriptors {
-		width := desc.End - desc.Start
-		if width > 20 && width < 500 {
-			filtered = append(filtered, desc)
-		}
-	}
-
-	if len(filtered) == 0 {
-		return nil
-	}
-
-	longest := filtered[0]
-	for _, desc := range filtered {
-		if preferredX > desc.Start && preferredX < desc.End {
-			log.Debug().Int("preferredX", preferredX).Msg("Returned slice containing preferred X")
-			return &desc
-		}
-		if (desc.End - desc.Start) > (longest.End - longest.Start) {
-			longest = desc
-		}
-	}
-
-	return &longest
 }
 
 func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration) error {
@@ -254,18 +317,29 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 
 			horizontalSlice := buf.Region(image.Rect(0, int(usedSlice), currentWidth, int(usedSlice)+1))
 			sliceDescriptors := getConsecutiveWhitePointsFromSlice(&horizontalSlice)
-			// MODIFIED: Pass currentWidth for intersection detection
-			longestConsecutive = getLongestConsecutiveWhiteSlice(sliceDescriptors, preferredX, currentWidth)
+
+			// Check for intersection first
+			if isIntersection(sliceDescriptors, 30) {
+				log.Debug().Msg("Intersection detected - taking straight path")
+				longestConsecutive = getStraightPath(sliceDescriptors, currentWidth)
+				if longestConsecutive != nil {
+					foundSliceY = int(usedSlice)
+				}
+			} else {
+				// Use width-based filter to eliminate glare
+				longestConsecutive = getValidTrackSlice(sliceDescriptors, preferredX)
+				if longestConsecutive != nil {
+					foundSliceY = int(usedSlice)
+				}
+			}
 
 			if longestConsecutive != nil && (preferredX < longestConsecutive.Start || preferredX > longestConsecutive.End) {
 				longestConsecutive = nil
-			} else if longestConsecutive != nil {
-				foundSliceY = int(usedSlice)
 			}
 			horizontalSlice.Close()
 		}
 
-		// MODIFIED: Added smoothing to reduce wobble
+		// Smooth steering to reduce wobble
 		if longestConsecutive != nil {
 			middleX := (longestConsecutive.Start + longestConsecutive.End) / 2
 			// Smoothing: 70% old, 30% new
@@ -283,7 +357,7 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 							X: uint32(longestConsecutive.Start),
 							Y: uint32(foundSliceY),
 						},
-						Radius: 1,
+						Radius: 2,
 					},
 				},
 			})
@@ -294,7 +368,7 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 							X: uint32(longestConsecutive.End),
 							Y: uint32(foundSliceY),
 						},
-						Radius: 1,
+						Radius: 2,
 					},
 				},
 			})
@@ -305,7 +379,7 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 							X: uint32(middleX),
 							Y: uint32(foundSliceY),
 						},
-						Radius: 1,
+						Radius: 2,
 					},
 				},
 			})
