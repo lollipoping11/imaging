@@ -252,7 +252,7 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		}
 
 		for uint32(usedSlice) < (uint32(imgHeight)-1) && (longestConsecutive == nil) {
-			usedSlice += 10
+			usedSlice += 5
 
 			if int(usedSlice) >= imgHeight-1 {
 				break
