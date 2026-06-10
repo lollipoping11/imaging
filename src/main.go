@@ -119,34 +119,37 @@ func detectFinishLine(buf *gocv.Mat, track *SliceDescriptor, foundSliceY int, im
 	xL := track.Start + 30
 	xR := track.End - 30
 	if xR-xL < 100 {
-		return false // track view too narrow to judge reliably
+		return false
 	}
 
 	rowsWithBars := 0
-	for y := foundSliceY + 6; y <= foundSliceY+60 && y < imgHeight-1; y += 6 {
+
+	for y := foundSliceY + 3; y <= foundSliceY+70 && y < imgHeight-1; y++ {
 		blackRuns := 0
 		runLen := 0
+
 		for x := xL; x <= xR; x++ {
-			if buf.GetUCharAt(y, x) == 0 {
+			if buf.GetUCharAt(y, x) < 40 {
 				runLen++
 			} else {
-				if runLen >= 25 {
+				if runLen >= 20 {
 					blackRuns++
 				}
 				runLen = 0
 			}
 		}
-		if runLen >= 25 {
+
+		if runLen >= 20 {
 			blackRuns++
 		}
+
 		if blackRuns >= 2 {
 			rowsWithBars++
 		}
 	}
 
-	return rowsWithBars >= 2
+	return rowsWithBars >= 6
 }
-
 func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration) error {
 	if configuration == nil {
 		return fmt.Errorf("configuration cannot be accessed")
