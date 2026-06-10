@@ -65,12 +65,9 @@ func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor 
 // Width-based selection, calibrated from logged data:
 //
 //	< 20px              -> noise, reject
-//	20-500px            -> normal track candidate (straights ~490, corners ~280-340)
-//	500px - 95% width   -> glare merged with track, reject (multi-scan tries lower row)
-//	>= 95% width        -> figure-8 crossing (638px observed) OR total washout.
-//	                       Accept: midpoint = image centre = steer straight,
-//	                       which is the correct action at the crossing and the
-//	                       safest action in a washout.
+//	20-500px            -> normal track candidate
+//	500px - 95% width   -> glare merged with track, reject
+//	>= 95% width        -> figure-8 crossing / washout, accept (steer straight)
 func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferredX int, imgWidth int) *SliceDescriptor {
 	if len(sliceDescriptors) == 0 {
 		return nil
@@ -82,11 +79,10 @@ func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferr
 	for _, desc := range sliceDescriptors {
 		width := desc.End - desc.Start
 		if width >= fullWidthMin {
-			filtered = append(filtered, desc) // crossing / washout: keep
+			filtered = append(filtered, desc)
 		} else if width > 20 && width < 500 {
-			filtered = append(filtered, desc) // normal track candidate
+			filtered = append(filtered, desc)
 		}
-		// 20px floor and the 500px..95% band are rejected
 	}
 
 	if len(filtered) == 0 {
@@ -105,6 +101,50 @@ func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferr
 	}
 
 	return &longest
+}
+
+// detectFinishLine looks for the finish strip: two black bars side by side
+// INSIDE the white track. It scans the rows just below the row where the
+// track was found, restricted to the track's x-span (shrunk to exclude the
+// black borders). A row containing >= 2 black runs of >= 25px each is a
+// finish-line row. Requiring 2+ such rows debounces noise.
+//
+// Nothing else produces this signature: corners are one white run, the
+// crossing is full white, glare is white, floor noise is outside the span.
+func detectFinishLine(buf *gocv.Mat, track *SliceDescriptor, foundSliceY int, imgHeight int) bool {
+	if track == nil {
+		return false
+	}
+
+	xL := track.Start + 30
+	xR := track.End - 30
+	if xR-xL < 100 {
+		return false // track view too narrow to judge reliably
+	}
+
+	rowsWithBars := 0
+	for y := foundSliceY + 6; y <= foundSliceY+60 && y < imgHeight-1; y += 6 {
+		blackRuns := 0
+		runLen := 0
+		for x := xL; x <= xR; x++ {
+			if buf.GetUCharAt(y, x) == 0 {
+				runLen++
+			} else {
+				if runLen >= 25 {
+					blackRuns++
+				}
+				runLen = 0
+			}
+		}
+		if runLen >= 25 {
+			blackRuns++
+		}
+		if blackRuns >= 2 {
+			rowsWithBars++
+		}
+	}
+
+	return rowsWithBars >= 2
 }
 
 func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration) error {
@@ -181,10 +221,7 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			thresholdValue = int(newThreshold)
 		}
 
-		// Dual threshold mode:
-		//   value == 1 -> Otsu automatic (good in normal lighting)
-		//   value >  1 -> fixed manual threshold (stable under glare, no flicker)
-		//   value == 0 -> no processing
+		// Dual threshold mode: 1 = Otsu auto, >1 = fixed manual, 0 = off
 		if thresholdValue > 0 {
 			gocv.CvtColor(buf, &buf, gocv.ColorBGRToGray)
 			if thresholdValue == 1 {
@@ -211,8 +248,6 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			usedSlice = uint32(sliceY)
 		}
 
-		// Multi-scan: step down the image 10px at a time until a valid track
-		// region is found. A row corrupted by glare gets skipped automatically.
 		for uint32(usedSlice) < (uint32(imgHeight)-1) && (longestConsecutive == nil) {
 			usedSlice += 10
 
@@ -236,9 +271,13 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			middleX := (longestConsecutive.Start + longestConsecutive.End) / 2
 			preferredX = middleX
 		} else {
-			// Track lost: drift memory back toward image centre so a stale
-			// preferredX (e.g. captured by glare) cannot stay pinned forever.
 			preferredX = preferredX + (imgWidth/2-preferredX)/10
+		}
+
+		// Finish line check: two black bars inside the track below the scan row
+		finishLineDetected := detectFinishLine(&buf, longestConsecutive, foundSliceY, imgHeight)
+		if finishLineDetected {
+			log.Info().Msg("FINISH LINE DETECTED")
 		}
 
 		canvasObjects := make([]*pb_output.CanvasObject, 0)
@@ -288,10 +327,17 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 
 		horizontalScans := make([]*pb_output.HorizontalScan, 0)
 		if longestConsecutive != nil {
+			scanY := uint32(foundSliceY)
+			// Y=9999 marks the finish line for the logger.
+			// XLeft/XRight stay REAL so the controller keeps steering normally
+			// (the controller only reads XLeft and XRight).
+			if finishLineDetected {
+				scanY = 9999
+			}
 			horizontalScans = append(horizontalScans, &pb_output.HorizontalScan{
 				XLeft:  uint32(longestConsecutive.Start),
 				XRight: uint32(longestConsecutive.End),
-				Y:      uint32(foundSliceY),
+				Y:      scanY,
 			})
 		} else {
 			log.Debug().Msg("No trajectory added")
