@@ -124,7 +124,7 @@ func detectFinishLine(buf *gocv.Mat, track *SliceDescriptor, foundSliceY int, im
 
 	rowsWithBars := 0
 
-	for y := foundSliceY + 3; y <= foundSliceY+70 && y < imgHeight-1; y++ {
+	for y := foundSliceY + 3; y <= foundSliceY+70 && y < imgHeight-1; y += 6 {
 		blackRuns := 0
 		runLen := 0
 
@@ -148,7 +148,7 @@ func detectFinishLine(buf *gocv.Mat, track *SliceDescriptor, foundSliceY int, im
 		}
 	}
 
-	return rowsWithBars >= 6
+	return rowsWithBars >= 2
 }
 func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration) error {
 	if configuration == nil {
