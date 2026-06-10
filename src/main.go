@@ -21,12 +21,6 @@ type SliceDescriptor struct {
 
 var thresholdValue int
 
-// Track width tracking variables
-var minTrackWidth int = 80  // Minimum expected track width
-var maxTrackWidth int = 400 // Maximum expected track width
-var widthConfidence int = 0 // How confident we are in the current range
-var validWidths []int       // Store recent valid widths
-
 func verticalScanUp(image *gocv.Mat, x int, startY int) int {
 	y := startY
 	for y >= 0 {
@@ -68,145 +62,49 @@ func getConsecutiveWhitePointsFromSlice(imageSlice *gocv.Mat) []SliceDescriptor 
 	return res
 }
 
-// Update the track width range based on valid measurements
-func updateTrackWidthRange(width int) {
-	if width < 20 || width > 800 {
-		return // Ignore obviously wrong values
-	}
-
-	// Store recent valid widths (keep last 20)
-	validWidths = append(validWidths, width)
-	if len(validWidths) > 20 {
-		validWidths = validWidths[1:]
-	}
-
-	// Calculate average of recent widths
-	if len(validWidths) > 5 {
-		sum := 0
-		for _, w := range validWidths {
-			sum += w
-		}
-		avgWidth := sum / len(validWidths)
-
-		// Set acceptable range: 60% to 140% of average
-		minTrackWidth = avgWidth * 60 / 100
-		maxTrackWidth = avgWidth * 140 / 100
-
-		// Clamp to reasonable absolute limits
-		if minTrackWidth < 40 {
-			minTrackWidth = 40
-		}
-		if maxTrackWidth > 600 {
-			maxTrackWidth = 600
-		}
-
-		widthConfidence++
-		if widthConfidence > 10 {
-			widthConfidence = 10
-		}
-
-		log.Debug().Int("width", width).Int("avg", avgWidth).Int("min", minTrackWidth).Int("max", maxTrackWidth).Msg("Track width range updated")
-	}
-}
-
-// MODIFIED: Width-based filter to eliminate glare
-func getValidTrackSlice(sliceDescriptors []SliceDescriptor, preferredX int) *SliceDescriptor {
+// Width-based selection, calibrated from logged data:
+//
+//	< 20px              -> noise, reject
+//	20-500px            -> normal track candidate (straights ~490, corners ~280-340)
+//	500px - 95% width   -> glare merged with track, reject (multi-scan tries lower row)
+//	>= 95% width        -> figure-8 crossing (638px observed) OR total washout.
+//	                       Accept: midpoint = image centre = steer straight,
+//	                       which is the correct action at the crossing and the
+//	                       safest action in a washout.
+func getLongestConsecutiveWhiteSlice(sliceDescriptors []SliceDescriptor, preferredX int, imgWidth int) *SliceDescriptor {
 	if len(sliceDescriptors) == 0 {
 		return nil
 	}
 
-	// First pass: Filter by width range (eliminates glare)
+	fullWidthMin := int(float64(imgWidth) * 0.95)
+
 	filtered := []SliceDescriptor{}
 	for _, desc := range sliceDescriptors {
 		width := desc.End - desc.Start
-
-		// Use dynamic width range if we have confidence, otherwise use default
-		if widthConfidence > 3 {
-			// We have learned the track width
-			if width >= minTrackWidth && width <= maxTrackWidth {
-				filtered = append(filtered, desc)
-			} else {
-				log.Debug().Int("width", width).Int("min", minTrackWidth).Int("max", maxTrackWidth).Msg("Filtered out by width")
-			}
-		} else {
-			// Still learning - use generous defaults
-			if width > 30 && width < 500 {
-				filtered = append(filtered, desc)
-			}
+		if width >= fullWidthMin {
+			filtered = append(filtered, desc) // crossing / washout: keep
+		} else if width > 20 && width < 500 {
+			filtered = append(filtered, desc) // normal track candidate
 		}
+		// 20px floor and the 500px..95% band are rejected
 	}
 
 	if len(filtered) == 0 {
 		return nil
 	}
 
-	// Try to find slice containing preferred X first
+	longest := filtered[0]
 	for _, desc := range filtered {
-		if preferredX >= desc.Start && preferredX <= desc.End {
-			// Update track width range with this valid measurement
-			updateTrackWidthRange(desc.End - desc.Start)
+		if preferredX > desc.Start && preferredX < desc.End {
+			log.Debug().Int("preferredX", preferredX).Msg("Returned slice containing preferred X")
 			return &desc
 		}
-	}
-
-	// If none contains preferred X, find closest
-	closest := &filtered[0]
-	minDistance := abs(preferredX - (closest.Start+closest.End)/2)
-
-	for i := 1; i < len(filtered); i++ {
-		centerX := (filtered[i].Start + filtered[i].End) / 2
-		distance := abs(preferredX - centerX)
-		if distance < minDistance {
-			minDistance = distance
-			closest = &filtered[i]
+		if (desc.End - desc.Start) > (longest.End - longest.Start) {
+			longest = desc
 		}
 	}
 
-	// Update track width range with this valid measurement
-	updateTrackWidthRange(closest.End - closest.Start)
-	return closest
-}
-
-// Detect if we're at an intersection (multiple track segments)
-func isIntersection(sliceDescriptors []SliceDescriptor, minGap int) bool {
-	if len(sliceDescriptors) >= 2 {
-		for i := 0; i < len(sliceDescriptors)-1; i++ {
-			gap := sliceDescriptors[i+1].Start - sliceDescriptors[i].End
-			if gap > minGap {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// Find the straight path (closest to image center) at intersections
-func getStraightPath(sliceDescriptors []SliceDescriptor, imageWidth int) *SliceDescriptor {
-	if len(sliceDescriptors) == 0 {
-		return nil
-	}
-
-	centerX := imageWidth / 2
-	closest := &sliceDescriptors[0]
-	minDistance := abs(centerX - (closest.Start+closest.End)/2)
-
-	for i := 1; i < len(sliceDescriptors); i++ {
-		segmentCenter := (sliceDescriptors[i].Start + sliceDescriptors[i].End) / 2
-		distance := abs(centerX - segmentCenter)
-		if distance < minDistance {
-			minDistance = distance
-			closest = &sliceDescriptors[i]
-		}
-	}
-
-	return closest
-}
-
-func abs(x int) int {
-	if x < 0 {
-		return -x
-	}
-	return x
+	return &longest
 }
 
 func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration) error {
@@ -271,10 +169,8 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		if buf.Empty() {
 			continue
 		}
-		currentWidth := buf.Cols()
-		currentHeight := buf.Rows()
-
-		log.Debug().Int("width", currentWidth).Int("height", currentHeight).Msg("Read image")
+		imgWidth := buf.Cols()
+		imgHeight := buf.Rows()
 
 		newThreshold, err := configuration.GetFloat("threshold-value")
 		if err != nil {
@@ -285,9 +181,17 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			thresholdValue = int(newThreshold)
 		}
 
+		// Dual threshold mode:
+		//   value == 1 -> Otsu automatic (good in normal lighting)
+		//   value >  1 -> fixed manual threshold (stable under glare, no flicker)
+		//   value == 0 -> no processing
 		if thresholdValue > 0 {
 			gocv.CvtColor(buf, &buf, gocv.ColorBGRToGray)
-			gocv.Threshold(buf, &buf, float32(thresholdValue), 255.0, gocv.ThresholdBinary+gocv.ThresholdOtsu)
+			if thresholdValue == 1 {
+				gocv.Threshold(buf, &buf, 0, 255.0, gocv.ThresholdBinary+gocv.ThresholdOtsu)
+			} else {
+				gocv.Threshold(buf, &buf, float32(thresholdValue), 255.0, gocv.ThresholdBinary)
+			}
 			kernel := gocv.GetStructuringElement(gocv.MorphRect, image.Pt(5, 5))
 			gocv.Dilate(buf, &buf, kernel)
 			gocv.Erode(buf, &buf, kernel)
@@ -297,9 +201,9 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 		var longestConsecutive *SliceDescriptor = nil
 		var foundSliceY int = sliceY
 
-		newBarY := verticalScanUp(&buf, preferredX, currentHeight-10) + 2
-		if newBarY >= currentHeight {
-			newBarY = currentHeight - 1
+		newBarY := verticalScanUp(&buf, preferredX, imgHeight-10) + 2
+		if newBarY >= imgHeight {
+			newBarY = imgHeight - 1
 		}
 
 		usedSlice := uint32(newBarY)
@@ -307,43 +211,34 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			usedSlice = uint32(sliceY)
 		}
 
-		// Multi-scan for track detection
-		for uint32(usedSlice) < (uint32(currentHeight)-1) && (longestConsecutive == nil) {
+		// Multi-scan: step down the image 10px at a time until a valid track
+		// region is found. A row corrupted by glare gets skipped automatically.
+		for uint32(usedSlice) < (uint32(imgHeight)-1) && (longestConsecutive == nil) {
 			usedSlice += 10
 
-			if int(usedSlice) >= currentHeight-1 {
+			if int(usedSlice) >= imgHeight-1 {
 				break
 			}
 
-			horizontalSlice := buf.Region(image.Rect(0, int(usedSlice), currentWidth, int(usedSlice)+1))
+			horizontalSlice := buf.Region(image.Rect(0, int(usedSlice), imgWidth, int(usedSlice)+1))
 			sliceDescriptors := getConsecutiveWhitePointsFromSlice(&horizontalSlice)
-
-			// Check for intersection first
-			if isIntersection(sliceDescriptors, 30) {
-				log.Debug().Msg("Intersection detected - taking straight path")
-				longestConsecutive = getStraightPath(sliceDescriptors, currentWidth)
-				if longestConsecutive != nil {
-					foundSliceY = int(usedSlice)
-				}
-			} else {
-				// Use width-based filter to eliminate glare
-				longestConsecutive = getValidTrackSlice(sliceDescriptors, preferredX)
-				if longestConsecutive != nil {
-					foundSliceY = int(usedSlice)
-				}
-			}
+			longestConsecutive = getLongestConsecutiveWhiteSlice(sliceDescriptors, preferredX, imgWidth)
 
 			if longestConsecutive != nil && (preferredX < longestConsecutive.Start || preferredX > longestConsecutive.End) {
 				longestConsecutive = nil
+			} else if longestConsecutive != nil {
+				foundSliceY = int(usedSlice)
 			}
 			horizontalSlice.Close()
 		}
 
-		// Smooth steering to reduce wobble
 		if longestConsecutive != nil {
 			middleX := (longestConsecutive.Start + longestConsecutive.End) / 2
-			// Smoothing: 70% old, 30% new
-			preferredX = (preferredX*7 + middleX*3) / 10
+			preferredX = middleX
+		} else {
+			// Track lost: drift memory back toward image centre so a stale
+			// preferredX (e.g. captured by glare) cannot stay pinned forever.
+			preferredX = preferredX + (imgWidth/2-preferredX)/10
 		}
 
 		canvasObjects := make([]*pb_output.CanvasObject, 0)
@@ -353,33 +248,24 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
 				Object: &pb_output.CanvasObject_Circle_{
 					Circle: &pb_output.CanvasObject_Circle{
-						Center: &pb_output.CanvasObject_Point{
-							X: uint32(longestConsecutive.Start),
-							Y: uint32(foundSliceY),
-						},
-						Radius: 2,
+						Center: &pb_output.CanvasObject_Point{X: uint32(longestConsecutive.Start), Y: uint32(foundSliceY)},
+						Radius: 1,
 					},
 				},
 			})
 			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
 				Object: &pb_output.CanvasObject_Circle_{
 					Circle: &pb_output.CanvasObject_Circle{
-						Center: &pb_output.CanvasObject_Point{
-							X: uint32(longestConsecutive.End),
-							Y: uint32(foundSliceY),
-						},
-						Radius: 2,
+						Center: &pb_output.CanvasObject_Point{X: uint32(longestConsecutive.End), Y: uint32(foundSliceY)},
+						Radius: 1,
 					},
 				},
 			})
 			canvasObjects = append(canvasObjects, &pb_output.CanvasObject{
 				Object: &pb_output.CanvasObject_Circle_{
 					Circle: &pb_output.CanvasObject_Circle{
-						Center: &pb_output.CanvasObject_Point{
-							X: uint32(middleX),
-							Y: uint32(foundSliceY),
-						},
-						Radius: 2,
+						Center: &pb_output.CanvasObject_Point{X: uint32(middleX), Y: uint32(foundSliceY)},
+						Radius: 1,
 					},
 				},
 			})
@@ -387,12 +273,14 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 
 		canvas := pb_output.Canvas{
 			Objects: canvasObjects,
-			Width:   uint32(currentWidth),
-			Height:  uint32(currentHeight),
+			Width:   uint32(imgWidth),
+			Height:  uint32(imgHeight),
 		}
 
-		compressionParams := []int{gocv.IMWriteJpegQuality, 30}
-		imgBytes, err := gocv.IMEncodeWithParams(".jpg", buf, compressionParams)
+		var compressionParams [2]int
+		compressionParams[0] = gocv.IMWriteJpegQuality
+		compressionParams[1] = 30
+		imgBytes, err := gocv.IMEncodeWithParams(".jpg", buf, compressionParams[:])
 		if err != nil {
 			log.Err(err).Msg("Error encoding image")
 			return err
@@ -415,8 +303,8 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			SensorOutput: &pb_output.SensorOutput_CameraOutput{
 				CameraOutput: &pb_output.CameraSensorOutput{
 					Resolution: &pb_output.Resolution{
-						Width:  uint32(currentWidth),
-						Height: uint32(currentHeight),
+						Width:  uint32(imgWidth),
+						Height: uint32(imgHeight),
 					},
 					DebugFrame: &pb_output.DebugFrame{
 						Jpeg:   imgBytes.GetBytes(),
@@ -439,8 +327,6 @@ func run(service roverlib.Service, configuration *roverlib.ServiceConfiguration)
 			log.Err(err).Int("byte len", len(outputBytes)).Msg("Error sending image")
 			return err
 		}
-
-		log.Debug().Msg("Sent image")
 	}
 }
 
